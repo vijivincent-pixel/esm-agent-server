@@ -177,6 +177,7 @@ def chat():
 
         # Apply changes
         all_changes = []
+        added_items = []
         for a in intent.get("actions", []):
             action = a["action"]
             field  = a["field"]
@@ -191,6 +192,8 @@ def chat():
                 html, added = insert_options_sorted(html, field, values)
                 if added:
                     all_changes.append(f"✅ Added {', '.join(added)} to {label}")
+                    for v in added:
+                        added_items.append({"field": field, "value": v})
                 else:
                     all_changes.append(f"ℹ️ {', '.join(values)} already exists in {label}")
 
@@ -210,8 +213,8 @@ def chat():
         push_file_to_github(html, sha, commit_msg)
 
         reply = "\n".join(all_changes)
-        reply += "\n\n🔄 Please refresh the form to see the updated options!"
-        return jsonify({"reply": reply})
+        reply += "\n\n🔄 Form updated! New options are now available in the dropdowns."
+        return jsonify({"reply": reply, "added": added_items})
 
     except Exception as e:
         return jsonify({"reply": f"❌ Error: {str(e)}"})
