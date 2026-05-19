@@ -1,0 +1,216 @@
+"""
+ESM Sales Form Agent Server
+----------------------------
+Hosted on Render (free tier)
+Receives chat requests from the form widget,
+uses Gemini to parse them, updates GitHub Pages.
+"""
+
+import os
+import json
+import base64
+import re
+import requests
+from datetime import datetime
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from google import genai
+
+app = Flask(__name__)
+CORS(app)  # Allow requests from GitHub Pages
+
+# ── Config (set these as Environment Variables on Render) ──
+GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
+GITHUB_TOKEN     = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO      = os.environ.get("GITHUB_REPO", "vijivincent-pixel/Sales-Activity")
+GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "form.html")
+GITHUB_BRANCH    = os.environ.get("GITHUB_BRANCH", "main")
+
+GITHUB_API = "https://api.github.com"
+GH_HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v3+json"
+}
+
+DROPDOWN_MAP = {
+    "brand":         "Brand",
+    "industry":      "Industry",
+    "hqCountry":     "HQ Country",
+    "customerName":  "Customer Name",
+    "customerName2": "Customer Name 2",
+    "role":          "Role",
+    "level":         "Level",
+    "salesRep":      "Sales Rep",
+    "pocCity":       "POC City",
+    "pocState":      "POC State",
+    "pocCountry":    "POC Country",
+    "type":          "Type",
+    "means":         "Means",
+    "topic":         "Topic",
+    "size":          "Size",
+}
+
+# ── GitHub helpers ────────────────────────────────────────
+
+def get_file_from_github():
+    url = f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}?ref={GITHUB_BRANCH}"
+    r = requests.get(url, headers=GH_HEADERS)
+    if r.status_code != 200:
+        raise Exception(f"GitHub fetch failed: {r.status_code}")
+    data = r.json()
+    return base64.b64decode(data["content"]).decode("utf-8"), data["sha"]
+
+def push_file_to_github(content, sha, commit_message):
+    url = f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+    payload = {
+        "message": commit_message,
+        "content": base64.b64encode(content.encode()).decode(),
+        "sha": sha,
+        "branch": GITHUB_BRANCH
+    }
+    r = requests.put(url, headers=GH_HEADERS, json=payload)
+    if r.status_code not in (200, 201):
+        raise Exception(f"GitHub push failed: {r.status_code}")
+
+# ── HTML option helpers ───────────────────────────────────
+
+def insert_options_sorted(html, field_name, new_options):
+    pattern = rf'(<select name="{field_name}"[^>]*>)(.*?)(</select>)'
+    match = re.search(pattern, html, re.DOTALL)
+    if not match:
+        return html, []
+    before, block, after = match.group(1), match.group(2), match.group(3)
+    existing = [o.strip() for o in re.findall(r'<option(?:[^>]*)>([^<]+)</option>', block)]
+    existing_lower = [o.lower() for o in existing]
+    added = []
+    for opt in new_options:
+        if opt.lower() not in existing_lower:
+            existing.append(opt)
+            added.append(opt)
+    if not added:
+        return html, []
+    sortable = sorted(
+        [o for o in existing if o not in ("— select —", "— search or select —", "__sep__")],
+        key=lambda x: x.lower()
+    )
+    new_block = (
+        '\n            <option value="">— search or select —</option>\n            '
+        + "\n            ".join(f"<option>{o}</option>" for o in sortable)
+        + "\n          "
+    )
+    return html[:match.start()] + before + new_block + after + html[match.end():], added
+
+def remove_options(html, field_name, options_to_remove):
+    pattern = rf'(<select name="{field_name}"[^>]*>)(.*?)(</select>)'
+    match = re.search(pattern, html, re.DOTALL)
+    if not match:
+        return html, []
+    before, block, after = match.group(1), match.group(2), match.group(3)
+    remove_lower = [o.lower() for o in options_to_remove]
+    removed = []
+    def remove_option(m):
+        text = m.group(1).strip()
+        if text.lower() in remove_lower:
+            removed.append(text)
+            return ""
+        return m.group(0)
+    new_block = re.sub(r'<option(?:[^>]*)>([^<]+)</option>', remove_option, block)
+    return html[:match.start()] + before + new_block + after + html[match.end():], removed
+
+# ── Gemini intent parsing ─────────────────────────────────
+
+def parse_intent(user_request):
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    fields_list = "\n".join([f'  "{k}": "{v}"' for k, v in DROPDOWN_MAP.items()])
+    prompt = f"""You manage a sales form dropdown options.
+Parse the user request into JSON.
+
+Available fields:
+{fields_list}
+
+User request: "{user_request}"
+
+Rules:
+- Map "Brand"/"Company" to "brand"
+- Map "Customer"/"Contact"/"Name" to "customerName"
+- Map "Role"/"Position"/"Title" to "role"
+- Return ONLY valid JSON, no markdown
+
+Return exactly:
+{{"actions":[{{"action":"add or remove","field":"field_name","values":["value1"]}}],"summary":"short description"}}"""
+
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=prompt
+    )
+    raw = response.text.strip()
+    raw = re.sub(r'^```(?:json)?|```$', '', raw, flags=re.MULTILINE).strip()
+    return json.loads(raw)
+
+# ── API Routes ────────────────────────────────────────────
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "ESM Agent Server is running ✅"})
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    try:
+        data = request.get_json()
+        user_message = data.get("message", "").strip()
+
+        if not user_message:
+            return jsonify({"reply": "Please type a request."})
+
+        # Parse intent with Gemini
+        intent = parse_intent(user_message)
+        if not intent.get("actions"):
+            return jsonify({"reply": "Sorry, I didn't understand that. Try something like: 'Add Spotify to Brand'"})
+
+        # Fetch HTML from GitHub
+        html, sha = get_file_from_github()
+
+        # Apply changes
+        all_changes = []
+        for a in intent.get("actions", []):
+            action = a["action"]
+            field  = a["field"]
+            values = a["values"]
+
+            if field not in DROPDOWN_MAP:
+                continue
+
+            label = DROPDOWN_MAP[field]
+
+            if action == "add":
+                html, added = insert_options_sorted(html, field, values)
+                if added:
+                    all_changes.append(f"✅ Added **{', '.join(added)}** to {label}")
+                else:
+                    all_changes.append(f"ℹ️ **{', '.join(values)}** already exists in {label}")
+
+            elif action == "remove":
+                html, removed = remove_options(html, field, values)
+                if removed:
+                    all_changes.append(f"✅ Removed **{', '.join(removed)}** from {label}")
+                else:
+                    all_changes.append(f"ℹ️ **{', '.join(values)}** not found in {label}")
+
+        if not any("✅" in c for c in all_changes):
+            return jsonify({"reply": "\n".join(all_changes) or "No changes needed."})
+
+        # Push to GitHub
+        timestamp  = datetime.now().strftime("%Y-%m-%d %H:%M")
+        commit_msg = f"[ESM Agent] {intent.get('summary', 'Update')} — {timestamp}"
+        push_file_to_github(html, sha, commit_msg)
+
+        reply = "\n".join(all_changes)
+        reply += "\n\n🔄 Please refresh the form to see the updated options!"
+        return jsonify({"reply": reply})
+
+    except Exception as e:
+        return jsonify({"reply": f"❌ Error: {str(e)}"})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
