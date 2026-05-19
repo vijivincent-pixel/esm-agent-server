@@ -1,9 +1,7 @@
 """
-ESM Sales Form Agent Server
-----------------------------
+ESM Sales Form Agent Server — powered by Claude (Anthropic)
+------------------------------------------------------------
 Hosted on Render (free tier)
-Receives chat requests from the form widget,
-uses Gemini to parse them, updates GitHub Pages.
 """
 
 import os
@@ -14,17 +12,17 @@ import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from google import genai
+import anthropic
 
 app = Flask(__name__)
-CORS(app)  # Allow requests from GitHub Pages
+CORS(app)
 
-# ── Config (set these as Environment Variables on Render) ──
-GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
-GITHUB_TOKEN     = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO      = os.environ.get("GITHUB_REPO", "vijivincent-pixel/Sales-Activity")
-GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "form.html")
-GITHUB_BRANCH    = os.environ.get("GITHUB_BRANCH", "main")
+# ── Config (set as Environment Variables on Render) ──
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO       = os.environ.get("GITHUB_REPO", "vijivincent-pixel/Sales-Activity")
+GITHUB_FILE_PATH  = os.environ.get("GITHUB_FILE_PATH", "form.html")
+GITHUB_BRANCH     = os.environ.get("GITHUB_BRANCH", "main")
 
 GITHUB_API = "https://api.github.com"
 GH_HEADERS = {
@@ -117,11 +115,12 @@ def remove_options(html, field_name, options_to_remove):
     new_block = re.sub(r'<option(?:[^>]*)>([^<]+)</option>', remove_option, block)
     return html[:match.start()] + before + new_block + after + html[match.end():], removed
 
-# ── Gemini intent parsing ─────────────────────────────────
+# ── Claude intent parsing ─────────────────────────────────
 
 def parse_intent(user_request):
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     fields_list = "\n".join([f'  "{k}": "{v}"' for k, v in DROPDOWN_MAP.items()])
+
     prompt = f"""You manage a sales form dropdown options.
 Parse the user request into JSON.
 
@@ -134,16 +133,22 @@ Rules:
 - Map "Brand"/"Company" to "brand"
 - Map "Customer"/"Contact"/"Name" to "customerName"
 - Map "Role"/"Position"/"Title" to "role"
-- Return ONLY valid JSON, no markdown
+- Map "City"/"POC City" to "pocCity"
+- Map "Country"/"POC Country" to "pocCountry"
+- Map "State"/"POC State" to "pocState"
+- Map "HQ Country" to "hqCountry"
+- Map "Industry"/"Sector" to "industry"
+- Return ONLY valid JSON, no markdown, no explanation
 
-Return exactly:
+Return exactly this format:
 {{"actions":[{{"action":"add or remove","field":"field_name","values":["value1"]}}],"summary":"short description"}}"""
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=prompt
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=500,
+        messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.text.strip()
+    raw = message.content[0].text.strip()
     raw = re.sub(r'^```(?:json)?|```$', '', raw, flags=re.MULTILINE).strip()
     return json.loads(raw)
 
@@ -151,7 +156,7 @@ Return exactly:
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ESM Agent Server is running ✅"})
+    return jsonify({"status": "ESM Agent Server is running ✅ (powered by Claude)"})
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -162,10 +167,10 @@ def chat():
         if not user_message:
             return jsonify({"reply": "Please type a request."})
 
-        # Parse intent with Gemini
+        # Parse intent with Claude
         intent = parse_intent(user_message)
         if not intent.get("actions"):
-            return jsonify({"reply": "Sorry, I didn't understand that. Try something like: 'Add Spotify to Brand'"})
+            return jsonify({"reply": "Sorry, I didn't understand that. Try: 'Add Cleo to Brand'"})
 
         # Fetch HTML from GitHub
         html, sha = get_file_from_github()
@@ -185,16 +190,16 @@ def chat():
             if action == "add":
                 html, added = insert_options_sorted(html, field, values)
                 if added:
-                    all_changes.append(f"✅ Added **{', '.join(added)}** to {label}")
+                    all_changes.append(f"✅ Added {', '.join(added)} to {label}")
                 else:
-                    all_changes.append(f"ℹ️ **{', '.join(values)}** already exists in {label}")
+                    all_changes.append(f"ℹ️ {', '.join(values)} already exists in {label}")
 
             elif action == "remove":
                 html, removed = remove_options(html, field, values)
                 if removed:
-                    all_changes.append(f"✅ Removed **{', '.join(removed)}** from {label}")
+                    all_changes.append(f"✅ Removed {', '.join(removed)} from {label}")
                 else:
-                    all_changes.append(f"ℹ️ **{', '.join(values)}** not found in {label}")
+                    all_changes.append(f"ℹ️ {', '.join(values)} not found in {label}")
 
         if not any("✅" in c for c in all_changes):
             return jsonify({"reply": "\n".join(all_changes) or "No changes needed."})
