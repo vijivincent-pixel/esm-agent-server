@@ -2,6 +2,7 @@
 ESM Sales Form Agent Server — powered by Claude (Anthropic)
 ------------------------------------------------------------
 Hosted on Render (free tier)
+Supports brand-linked customer name additions.
 """
 
 import os
@@ -21,7 +22,7 @@ CORS(app)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO       = os.environ.get("GITHUB_REPO", "vijivincent-pixel/Sales-Activity")
-GITHUB_FILE_PATH  = os.environ.get("GITHUB_FILE_PATH", "form.html")
+GITHUB_FILE_PATH  = os.environ.get("GITHUB_FILE_PATH", "index.html")
 GITHUB_BRANCH     = os.environ.get("GITHUB_BRANCH", "main")
 
 GITHUB_API = "https://api.github.com"
@@ -115,6 +116,38 @@ def remove_options(html, field_name, options_to_remove):
     new_block = re.sub(r'<option(?:[^>]*)>([^<]+)</option>', remove_option, block)
     return html[:match.start()] + before + new_block + after + html[match.end():], removed
 
+def update_brand_db(html, brand, field, value):
+    """Update BRAND_DB JSON inside the HTML to link a value to a brand."""
+    start_marker = 'const BRAND_DB = '
+    end_marker   = ';\n\n// Fields that can be autofilled'
+    start_idx = html.find(start_marker)
+    end_idx   = html.find(end_marker, start_idx)
+    if start_idx == -1 or end_idx == -1:
+        return html, False
+
+    db_str = html[start_idx + len(start_marker):end_idx]
+    try:
+        db = json.loads(db_str)
+    except json.JSONDecodeError:
+        return html, False
+
+    # Add or update brand entry
+    if brand not in db:
+        db[brand] = {}
+
+    if field not in db[brand]:
+        db[brand][field] = {"byFreq": [value], "top": value, "topPct": 100}
+    else:
+        freq_list = db[brand][field].get("byFreq", [])
+        if value not in freq_list:
+            freq_list.insert(0, value)  # Put new value at top (most relevant)
+            db[brand][field]["byFreq"] = freq_list
+            db[brand][field]["top"] = freq_list[0]
+
+    new_db_str = json.dumps(db, separators=(',', ':'))
+    html = html[:start_idx + len(start_marker)] + new_db_str + html[end_idx:]
+    return html, True
+
 # ── Claude intent parsing ─────────────────────────────────
 
 def parse_intent(user_request):
@@ -138,10 +171,11 @@ Rules:
 - Map "State"/"POC State" to "pocState"
 - Map "HQ Country" to "hqCountry"
 - Map "Industry"/"Sector" to "industry"
+- If the user says "for [Brand]" or "works for [Brand]" or "at [Brand]", extract the brand name into "brandLink"
 - Return ONLY valid JSON, no markdown, no explanation
 
 Return exactly this format:
-{{"actions":[{{"action":"add or remove","field":"field_name","values":["value1"]}}],"summary":"short description"}}"""
+{{"actions":[{{"action":"add or remove","field":"field_name","values":["value1"],"brandLink":"BrandName or null"}}],"summary":"short description"}}"""
 
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -170,18 +204,21 @@ def chat():
         # Parse intent with Claude
         intent = parse_intent(user_message)
         if not intent.get("actions"):
-            return jsonify({"reply": "Sorry, I didn't understand that. Try: 'Add Cleo to Brand'"})
+            return jsonify({"reply": "Sorry, I didn't understand that. Try: 'Add Cleo to Brand' or 'Add John Smith to Customer Name for Cleo'"})
 
         # Fetch HTML from GitHub
         html, sha = get_file_from_github()
 
         # Apply changes
         all_changes = []
-        added_items = []
+        added_items  = []
+        brand_links  = []
+
         for a in intent.get("actions", []):
-            action = a["action"]
-            field  = a["field"]
-            values = a["values"]
+            action     = a["action"]
+            field      = a["field"]
+            values     = a["values"]
+            brand_link = a.get("brandLink")
 
             if field not in DROPDOWN_MAP:
                 continue
@@ -194,8 +231,26 @@ def chat():
                     all_changes.append(f"✅ Added {', '.join(added)} to {label}")
                     for v in added:
                         added_items.append({"field": field, "value": v})
+
+                    # If brand link provided, update BRAND_DB too
+                    if brand_link and brand_link.lower() != "null":
+                        for v in added:
+                            html, db_updated = update_brand_db(html, brand_link, field, v)
+                            if db_updated:
+                                all_changes.append(f"✅ Linked {v} to {brand_link} in suggestions")
+                                brand_links.append({"brand": brand_link, "field": field, "value": v})
                 else:
-                    all_changes.append(f"ℹ️ {', '.join(values)} already exists in {label}")
+                    # Even if already exists, still update brand link if provided
+                    if brand_link and brand_link.lower() != "null":
+                        for v in values:
+                            html, db_updated = update_brand_db(html, brand_link, field, v)
+                            if db_updated:
+                                all_changes.append(f"✅ Linked {v} to {brand_link} in suggestions")
+                                brand_links.append({"brand": brand_link, "field": field, "value": v})
+                            else:
+                                all_changes.append(f"ℹ️ {v} already linked to {brand_link}")
+                    else:
+                        all_changes.append(f"ℹ️ {', '.join(values)} already exists in {label}")
 
             elif action == "remove":
                 html, removed = remove_options(html, field, values)
@@ -205,7 +260,7 @@ def chat():
                     all_changes.append(f"ℹ️ {', '.join(values)} not found in {label}")
 
         if not any("✅" in c for c in all_changes):
-            return jsonify({"reply": "\n".join(all_changes) or "No changes needed."})
+            return jsonify({"reply": "\n".join(all_changes) or "No changes needed.", "added": [], "brandLinks": []})
 
         # Push to GitHub
         timestamp  = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -214,10 +269,10 @@ def chat():
 
         reply = "\n".join(all_changes)
         reply += "\n\n🔄 Form updated! New options are now available in the dropdowns."
-        return jsonify({"reply": reply, "added": added_items})
+        return jsonify({"reply": reply, "added": added_items, "brandLinks": brand_links})
 
     except Exception as e:
-        return jsonify({"reply": f"❌ Error: {str(e)}"})
+        return jsonify({"reply": f"❌ Error: {str(e)}", "added": [], "brandLinks": []})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
