@@ -1,15 +1,10 @@
 """
-ESM Sales Form Agent Server — powered by Claude (Anthropic)
-------------------------------------------------------------
-Hosted on Render (free tier)
-Supports brand-linked customer name additions.
+ESM Sales Form Agent Server — powered by Claude
+Calls Apps Script API to update Google Sheets
+No service account needed — uses secret token auth
 """
 
-import os
-import json
-import base64
-import re
-import requests
+import os, json, re, requests, threading, time
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -18,142 +13,168 @@ import anthropic
 app = Flask(__name__)
 CORS(app)
 
-# ── Config (set as Environment Variables on Render) ──
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO       = os.environ.get("GITHUB_REPO", "vijivincent-pixel/Sales-Activity")
-GITHUB_FILE_PATH  = os.environ.get("GITHUB_FILE_PATH", "index.html")
-GITHUB_BRANCH     = os.environ.get("GITHUB_BRANCH", "main")
-
-GITHUB_API = "https://api.github.com"
-GH_HEADERS = {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github.v3+json"
-}
+# ── Config (set as Render environment variables) ──────────
+ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+APPS_SCRIPT_URL    = os.environ.get("APPS_SCRIPT_URL", "")
+RENDER_SECRET_TOKEN = "1cc95fd5cdfb4e22de2916252fdcbc202cf37feac1c2cad3be4845ca126bedee"
+# ─────────────────────────────────────────────────────────
 
 DROPDOWN_MAP = {
-    "brand":         "Brand",
-    "industry":      "Industry",
-    "hqCountry":     "HQ Country",
-    "customerName":  "Customer Name",
-    "customerName2": "Customer Name 2",
-    "role":          "Role",
-    "level":         "Level",
-    "salesRep":      "Sales Rep",
-    "pocCity":       "POC City",
-    "pocState":      "POC State",
-    "pocCountry":    "POC Country",
-    "type":          "Type",
-    "means":         "Means",
-    "topic":         "Topic",
-    "size":          "Size",
+    "brand":"Brand","industry":"Industry","hqCountry":"HQ Country",
+    "customerName":"Customer Name","customerName2":"Customer Name 2",
+    "role":"Role","level":"Level","salesRep":"Sales Rep",
+    "pocCity":"POC City","pocState":"POC State","pocCountry":"POC Country",
+    "type":"Type","means":"Means","topic":"Topic","size":"Size",
 }
 
-# ── GitHub helpers ────────────────────────────────────────
-
-def get_file_from_github():
-    url = f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}?ref={GITHUB_BRANCH}"
-    r = requests.get(url, headers=GH_HEADERS)
-    if r.status_code != 200:
-        raise Exception(f"GitHub fetch failed: {r.status_code}")
-    data = r.json()
-    return base64.b64decode(data["content"]).decode("utf-8"), data["sha"]
-
-def push_file_to_github(content, sha, commit_message):
-    url = f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
-    payload = {
-        "message": commit_message,
-        "content": base64.b64encode(content.encode()).decode(),
-        "sha": sha,
-        "branch": GITHUB_BRANCH
-    }
-    r = requests.put(url, headers=GH_HEADERS, json=payload)
-    if r.status_code not in (200, 201):
-        raise Exception(f"GitHub push failed: {r.status_code}")
-
-# ── HTML option helpers ───────────────────────────────────
-
-def insert_options_sorted(html, field_name, new_options):
-    pattern = rf'(<select name="{field_name}"[^>]*>)(.*?)(</select>)'
-    match = re.search(pattern, html, re.DOTALL)
-    if not match:
-        return html, []
-    before, block, after = match.group(1), match.group(2), match.group(3)
-    existing = [o.strip() for o in re.findall(r'<option(?:[^>]*)>([^<]+)</option>', block)]
-    existing_lower = [o.lower() for o in existing]
-    added = []
-    for opt in new_options:
-        if opt.lower() not in existing_lower:
-            existing.append(opt)
-            added.append(opt)
-    if not added:
-        return html, []
-    sortable = sorted(
-        [o for o in existing if o not in ("— select —", "— search or select —", "__sep__")],
-        key=lambda x: x.lower()
-    )
-    new_block = (
-        '\n            <option value="">— search or select —</option>\n            '
-        + "\n            ".join(f"<option>{o}</option>" for o in sortable)
-        + "\n          "
-    )
-    return html[:match.start()] + before + new_block + after + html[match.end():], added
-
-def remove_options(html, field_name, options_to_remove):
-    pattern = rf'(<select name="{field_name}"[^>]*>)(.*?)(</select>)'
-    match = re.search(pattern, html, re.DOTALL)
-    if not match:
-        return html, []
-    before, block, after = match.group(1), match.group(2), match.group(3)
-    remove_lower = [o.lower() for o in options_to_remove]
-    removed = []
-    def remove_option(m):
-        text = m.group(1).strip()
-        if text.lower() in remove_lower:
-            removed.append(text)
-            return ""
-        return m.group(0)
-    new_block = re.sub(r'<option(?:[^>]*)>([^<]+)</option>', remove_option, block)
-    return html[:match.start()] + before + new_block + after + html[match.end():], removed
-
-def update_brand_db(html, brand, field, value):
-    """Update BRAND_DB JSON inside the HTML to link a value to a brand."""
-    start_marker = 'const BRAND_DB = '
-    end_marker   = ';\n\n// Fields that can be autofilled'
-    start_idx = html.find(start_marker)
-    end_idx   = html.find(end_marker, start_idx)
-    if start_idx == -1 or end_idx == -1:
-        return html, False
-
-    db_str = html[start_idx + len(start_marker):end_idx]
+def call_apps_script(action, **kwargs):
+    """Call the Apps Script API endpoint."""
     try:
-        db = json.loads(db_str)
-    except json.JSONDecodeError:
-        return html, False
+        params = {"token": RENDER_SECRET_TOKEN, "action": action}
+        params.update(kwargs)
+        response = requests.post(
+            APPS_SCRIPT_URL,
+            data=params,
+            timeout=30,
+            allow_redirects=True
+        )
+        if response.status_code == 200:
+            try:
+                return response.json()
+            except:
+                return {"success": True, "message": response.text}
+        return {"success": False, "message": f"HTTP {response.status_code}"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
-    # Add or update brand entry
-    if brand not in db:
-        db[brand] = {}
+def add_option(field, value):
+    """Add a new option to a dropdown via Apps Script."""
+    result = call_apps_script("add_option", field=field, value=value)
+    if result.get("success"):
+        return True, result.get("message", "added")
+    return False, result.get("message", "unknown error")
 
-    if field not in db[brand]:
-        db[brand][field] = {"byFreq": [value], "top": value, "topPct": 100}
-    else:
-        freq_list = db[brand][field].get("byFreq", [])
-        if value not in freq_list:
-            freq_list.insert(0, value)  # Put new value at top (most relevant)
-            db[brand][field]["byFreq"] = freq_list
-            db[brand][field]["top"] = freq_list[0]
+def update_brand_db(brand, field, value):
+    """Update BrandDB via Apps Script."""
+    call_apps_script("update_brand_db", brand=brand, field=field, value=value)
 
-    new_db_str = json.dumps(db, separators=(',', ':'))
-    html = html[:start_idx + len(start_marker)] + new_db_str + html[end_idx:]
-    return html, True
+def batch_update(updates):
+    """Send multiple updates in one Apps Script call."""
+    result = call_apps_script(
+        "batch_update",
+        updates=json.dumps(updates)
+    )
+    return result
 
-# ── Claude intent parsing ─────────────────────────────────
+def handle_structured_request(payload_str):
+    """Handle structured requests from New Brand / New Contact panels."""
+    try:
+        payload = json.loads(payload_str)
+        action  = payload.get("action")
+        changes = []
+        added_items = []
+        brand_links = []
+
+        if action == "add_brand":
+            brand       = payload.get("brand", "").strip()
+            industry    = payload.get("industry", "").strip()
+            country     = payload.get("country", "").strip()
+            customer    = payload.get("customer", "").strip()
+            role        = payload.get("role", "").strip()
+            level       = payload.get("level", "").strip()
+            city        = payload.get("city", "").strip()
+            poc_country = payload.get("pocCountry", "").strip()
+            rep         = payload.get("rep", "").strip()
+
+            if not brand:
+                return {"reply": "❌ Brand name is required.", "added": [], "brandLinks": []}
+
+            # Build batch updates
+            updates = []
+            field_map = [
+                ("brand", brand, None),
+                ("industry", industry, brand),
+                ("hqCountry", country, brand),
+                ("customerName", customer, brand),
+                ("role", role, brand),
+                ("pocCity", city, brand),
+                ("pocCountry", poc_country, brand),
+            ]
+
+            for field, val, link_brand in field_map:
+                if not val: continue
+                updates.append({
+                    "field": field,
+                    "value": val,
+                    "brand": link_brand
+                })
+
+            # Send batch to Apps Script
+            results = batch_update(updates)
+
+            for update in updates:
+                field = update["field"]
+                val   = update["value"]
+                label = DROPDOWN_MAP.get(field, field)
+                changes.append(f"✅ Added {val} to {label}")
+                added_items.append({"field": field, "value": val})
+                if update.get("brand"):
+                    brand_links.append({"brand": update["brand"], "field": field, "value": val})
+
+            # Level and rep — only link to brand, don't add to dropdown
+            if level: update_brand_db(brand, "level", level)
+            if rep:   update_brand_db(brand, "salesRep", rep)
+
+        elif action == "add_contact":
+            brand       = payload.get("brand", "").strip()
+            customer    = payload.get("customer", "").strip()
+            role        = payload.get("role", "").strip()
+            level       = payload.get("level", "").strip()
+            city        = payload.get("city", "").strip()
+            poc_country = payload.get("pocCountry", "").strip()
+            rep         = payload.get("rep", "").strip()
+
+            if not brand or not customer:
+                return {"reply": "❌ Brand and Customer Name are required.", "added": [], "brandLinks": []}
+
+            updates = []
+            field_map = [
+                ("customerName", customer, brand),
+                ("role", role, brand),
+                ("pocCity", city, brand),
+                ("pocCountry", poc_country, brand),
+            ]
+
+            for field, val, link_brand in field_map:
+                if not val: continue
+                updates.append({"field": field, "value": val, "brand": link_brand})
+
+            batch_update(updates)
+
+            for update in updates:
+                field = update["field"]
+                val   = update["value"]
+                label = DROPDOWN_MAP.get(field, field)
+                changes.append(f"✅ Added {val} to {label}")
+                added_items.append({"field": field, "value": val})
+                brand_links.append({"brand": brand, "field": field, "value": val})
+
+            if level: update_brand_db(brand, "level", level)
+            if rep:   update_brand_db(brand, "salesRep", rep)
+
+        if not changes:
+            return {"reply": "ℹ️ No changes were needed.", "added": [], "brandLinks": []}
+
+        reply = "\n".join(changes) + "\n\n🔄 New options are now available in the dropdowns!"
+        return {"reply": reply, "added": added_items, "brandLinks": brand_links}
+
+    except Exception as e:
+        return {"reply": f"❌ Error: {str(e)}", "added": [], "brandLinks": []}
 
 def parse_intent(user_request):
+    """Parse free-text using Claude."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     fields_list = "\n".join([f'  "{k}": "{v}"' for k, v in DROPDOWN_MAP.items()])
-
     prompt = f"""You manage a sales form dropdown options.
 Parse the user request into JSON.
 
@@ -171,10 +192,10 @@ Rules:
 - Map "State"/"POC State" to "pocState"
 - Map "HQ Country" to "hqCountry"
 - Map "Industry"/"Sector" to "industry"
-- If the user says "for [Brand]" or "works for [Brand]" or "at [Brand]", extract the brand name into "brandLink"
-- Return ONLY valid JSON, no markdown, no explanation
+- If user says "for [Brand]" extract brandLink
+- Return ONLY valid JSON, no markdown
 
-Return exactly this format:
+Format:
 {{"actions":[{{"action":"add or remove","field":"field_name","values":["value1"],"brandLink":"BrandName or null"}}],"summary":"short description"}}"""
 
     message = client.messages.create(
@@ -186,33 +207,39 @@ Return exactly this format:
     raw = re.sub(r'^```(?:json)?|```$', '', raw, flags=re.MULTILINE).strip()
     return json.loads(raw)
 
-# ── API Routes ────────────────────────────────────────────
-
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ESM Agent Server is running ✅ (powered by Claude)"})
 
+@app.route("/ping", methods=["GET"])
+def ping():
+    return jsonify({"status": "pong", "time": datetime.now().isoformat()})
+
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
-        data = request.get_json()
-        user_message = data.get("message", "").strip()
+        data    = request.get_json()
+        message = data.get("message", "").strip()
+        mode    = data.get("mode", "text")
 
-        if not user_message:
-            return jsonify({"reply": "Please type a request."})
+        if not message:
+            return jsonify({"reply": "Please type a request.", "added": [], "brandLinks": []})
 
-        # Parse intent with Claude
-        intent = parse_intent(user_message)
+        # Structured mode from New Brand / New Contact panels
+        if mode == "structured":
+            return jsonify(handle_structured_request(message))
+
+        # Free text mode — use Claude to parse
+        intent = parse_intent(message)
         if not intent.get("actions"):
-            return jsonify({"reply": "Sorry, I didn't understand that. Try: 'Add Cleo to Brand' or 'Add John Smith to Customer Name for Cleo'"})
+            return jsonify({
+                "reply": "Sorry, I didn't understand. Try: 'Add Cape Town to POC City'",
+                "added": [], "brandLinks": []
+            })
 
-        # Fetch HTML from GitHub
-        html, sha = get_file_from_github()
-
-        # Apply changes
         all_changes = []
-        added_items  = []
-        brand_links  = []
+        added_items = []
+        brand_links = []
 
         for a in intent.get("actions", []):
             action     = a["action"]
@@ -226,54 +253,49 @@ def chat():
             label = DROPDOWN_MAP[field]
 
             if action == "add":
-                html, added = insert_options_sorted(html, field, values)
-                if added:
-                    all_changes.append(f"✅ Added {', '.join(added)} to {label}")
-                    for v in added:
-                        added_items.append({"field": field, "value": v})
-
-                    # If brand link provided, update BRAND_DB too
-                    if brand_link and brand_link.lower() != "null":
-                        for v in added:
-                            html, db_updated = update_brand_db(html, brand_link, field, v)
-                            if db_updated:
-                                all_changes.append(f"✅ Linked {v} to {brand_link} in suggestions")
-                                brand_links.append({"brand": brand_link, "field": field, "value": v})
-                else:
-                    # Even if already exists, still update brand link if provided
-                    if brand_link and brand_link.lower() != "null":
-                        for v in values:
-                            html, db_updated = update_brand_db(html, brand_link, field, v)
-                            if db_updated:
-                                all_changes.append(f"✅ Linked {v} to {brand_link} in suggestions")
-                                brand_links.append({"brand": brand_link, "field": field, "value": v})
-                            else:
-                                all_changes.append(f"ℹ️ {v} already linked to {brand_link}")
+                for val in values:
+                    ok, msg = add_option(field, val)
+                    if ok and msg == "added":
+                        all_changes.append(f"✅ Added {val} to {label}")
+                        added_items.append({"field": field, "value": val})
+                        if brand_link and brand_link.lower() != "null":
+                            update_brand_db(brand_link, field, val)
+                            brand_links.append({"brand": brand_link, "field": field, "value": val})
+                    elif ok and msg == "already_exists":
+                        if brand_link and brand_link.lower() != "null":
+                            update_brand_db(brand_link, field, val)
+                            brand_links.append({"brand": brand_link, "field": field, "value": val})
+                            all_changes.append(f"✅ Linked {val} to {brand_link}")
+                        else:
+                            all_changes.append(f"ℹ️ {val} already exists in {label}")
                     else:
-                        all_changes.append(f"ℹ️ {', '.join(values)} already exists in {label}")
+                        all_changes.append(f"❌ Could not add {val}: {msg}")
 
-            elif action == "remove":
-                html, removed = remove_options(html, field, values)
-                if removed:
-                    all_changes.append(f"✅ Removed {', '.join(removed)} from {label}")
-                else:
-                    all_changes.append(f"ℹ️ {', '.join(values)} not found in {label}")
-
-        if not any("✅" in c for c in all_changes):
-            return jsonify({"reply": "\n".join(all_changes) or "No changes needed.", "added": [], "brandLinks": []})
-
-        # Push to GitHub
-        timestamp  = datetime.now().strftime("%Y-%m-%d %H:%M")
-        commit_msg = f"[ESM Agent] {intent.get('summary', 'Update')} — {timestamp}"
-        push_file_to_github(html, sha, commit_msg)
+        if not all_changes:
+            return jsonify({"reply": "No changes made.", "added": [], "brandLinks": []})
 
         reply = "\n".join(all_changes)
-        reply += "\n\n🔄 Form updated! New options are now available in the dropdowns."
+        if any("✅" in c for c in all_changes):
+            reply += "\n\n🔄 New options are now available in the dropdowns!"
+
         return jsonify({"reply": reply, "added": added_items, "brandLinks": brand_links})
 
     except Exception as e:
         return jsonify({"reply": f"❌ Error: {str(e)}", "added": [], "brandLinks": []})
 
+def keep_alive():
+    time.sleep(60)
+    while True:
+        try:
+            port = os.environ.get("PORT", "5000")
+            requests.get(f"http://localhost:{port}/ping", timeout=5)
+        except:
+            pass
+        time.sleep(600)
+
 if __name__ == "__main__":
+    threading.Thread(target=keep_alive, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+else:
+    threading.Thread(target=keep_alive, daemon=True).start()
