@@ -292,7 +292,10 @@ def keep_alive():
         except:
             pass
         time.sleep(600)
-
+@app.route("/test-appsscript", methods=["GET"])
+def test_appsscript():
+    result = call_apps_script("add_option", field="brand", value="RenderTest123")
+    return jsonify(result)
 if __name__ == "__main__":
     threading.Thread(target=keep_alive, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
